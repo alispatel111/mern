@@ -24,13 +24,53 @@ console.log("Environment variables loaded:", {
 // Fix Mongoose deprecation warning
 mongoose.set("strictQuery", false)
 
+// Global connection variable to reuse connections
+let cachedConnection = null
+
+// Connect to MongoDB with connection reuse for serverless
+const connectToDatabase = async () => {
+  if (cachedConnection && mongoose.connection.readyState === 1) {
+    console.log("Using cached MongoDB connection")
+    return cachedConnection
+  }
+
+  try {
+    console.log("Creating new MongoDB connection...")
+    
+    // Close any existing connections
+    if (mongoose.connection.readyState !== 0) {
+      await mongoose.disconnect()
+    }
+
+    const connection = await mongoose.connect(process.env.MONGODB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      serverSelectionTimeoutMS: 10000, // 10 seconds
+      socketTimeoutMS: 45000, // 45 seconds
+      maxPoolSize: 10, // Maintain up to 10 socket connections
+      minPoolSize: 5, // Maintain a minimum of 5 socket connections
+      maxIdleTimeMS: 30000, // Close connections after 30 seconds of inactivity
+      bufferCommands: false, // Disable mongoose buffering
+      bufferMaxEntries: 0, // Disable mongoose buffering
+    })
+
+    cachedConnection = connection
+    console.log("Connected to MongoDB successfully")
+    return connection
+  } catch (error) {
+    console.error("MongoDB connection error:", error)
+    cachedConnection = null
+    throw error
+  }
+}
+
 // Create Express app
 const app = express()
 
 // Middleware
 app.use(
   cors({
-    origin: "*",
+    origin: process.env.CLIENT_URL || "*",
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     credentials: true,
   }),
@@ -40,11 +80,24 @@ app.use(
 app.use(express.json({ limit: "50mb" }))
 app.use(express.urlencoded({ limit: "50mb", extended: true }))
 
+// Database connection middleware - ensure connection before each request
+app.use(async (req, res, next) => {
+  try {
+    await connectToDatabase()
+    next()
+  } catch (error) {
+    console.error("Database connection failed:", error)
+    return res.status(500).json({ 
+      message: "Database connection failed", 
+      error: error.message 
+    })
+  }
+})
+
 // Debug middleware to log requests
 app.use((req, res, next) => {
   console.log(`${req.method} ${req.originalUrl}`)
-  console.log("Request headers:", req.headers)
-
+  
   // Log request body for POST requests (but truncate if too large)
   if (req.method === "POST" || req.method === "PUT") {
     const bodyClone = { ...req.body }
@@ -57,45 +110,45 @@ app.use((req, res, next) => {
   next()
 })
 
-// Connect to MongoDB with better error handling
-mongoose
-  .connect(process.env.MONGODB_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-    serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
-  })
-  .then(() => console.log("Connected to MongoDB"))
-  .catch((err) => {
-    console.error("MongoDB connection error:", err)
-    // Write to a file that Vercel can access in the logs
-    try {
-      fs.writeFileSync("/tmp/mongodb-error.log", JSON.stringify(err, null, 2))
-    } catch (fileErr) {
-      console.error("Could not write to error log file:", fileErr)
-    }
-  })
-
 // API routes
 app.use("/api/auth", authRoutes)
 
 // Test route to verify server is working
-app.get("/api/test", (req, res) => {
-  res.json({ message: "Server is working!" })
+app.get("/api/test", async (req, res) => {
+  try {
+    // Test database connection
+    const dbState = mongoose.connection.readyState
+    const dbStatus = dbState === 1 ? "connected" : "disconnected"
+    
+    res.json({ 
+      message: "Server is working!",
+      database: dbStatus,
+      timestamp: new Date().toISOString()
+    })
+  } catch (error) {
+    res.status(500).json({ 
+      message: "Server test failed", 
+      error: error.message 
+    })
+  }
 })
 
 // Add a detailed health check endpoint
-app.get("/api/health", (req, res) => {
+app.get("/api/health", async (req, res) => {
   try {
+    // Ensure database connection
+    await connectToDatabase()
+    
     const health = {
       status: "ok",
       timestamp: new Date(),
       environment: process.env.NODE_ENV,
       mongodb: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+      mongodb_state: mongoose.connection.readyState,
       uptime: process.uptime(),
       memory: process.memoryUsage(),
       env_vars: {
         NODE_ENV: process.env.NODE_ENV,
-        // Don't include sensitive variables like MONGODB_URI or JWT_SECRET
         MONGODB_URI: process.env.MONGODB_URI ? "set" : "not set",
         JWT_SECRET: process.env.JWT_SECRET ? "set" : "not set",
         EMAIL_USER: process.env.EMAIL_USER ? "set" : "not set",
@@ -106,29 +159,27 @@ app.get("/api/health", (req, res) => {
     res.status(200).json(health)
   } catch (error) {
     console.error("Error in health check endpoint:", error)
-    res.status(500).json({ message: "Health check failed", error: error.message })
+    res.status(500).json({ 
+      message: "Health check failed", 
+      error: error.message,
+      mongodb: "disconnected"
+    })
   }
 })
 
 // Root route for testing
-app.get("/", (req, res) => {
-  res.json({ message: "MERN Auth API is running!" })
-})
-
-// Route debugging - log all registered routes
-console.log("Registered routes:")
-app._router.stack.forEach((middleware) => {
-  if (middleware.route) {
-    // Routes registered directly on the app
-    console.log(`${Object.keys(middleware.route.methods)} ${middleware.route.path}`)
-  } else if (middleware.name === "router") {
-    // Router middleware
-    middleware.handle.stack.forEach((handler) => {
-      if (handler.route) {
-        const path = handler.route.path
-        const methods = Object.keys(handler.route.methods)
-        console.log(`${methods} /api/auth${path}`)
-      }
+app.get("/", async (req, res) => {
+  try {
+    await connectToDatabase()
+    res.json({ 
+      message: "MERN Auth API is running!",
+      database: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+      version: "1.0.0"
+    })
+  } catch (error) {
+    res.status(500).json({ 
+      message: "MERN Auth API is running but database connection failed!",
+      error: error.message
     })
   }
 })
@@ -204,9 +255,34 @@ app.use((err, req, res, next) => {
   res.status(500).json({ message: "Something went wrong!" })
 })
 
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('Received SIGINT, closing MongoDB connection...')
+  await mongoose.connection.close()
+  process.exit(0)
+})
+
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, closing MongoDB connection...')
+  await mongoose.connection.close()
+  process.exit(0)
+})
+
 // Start server
 const PORT = process.env.PORT || 5000
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`)
-  console.log(`API available at http://localhost:${PORT}/api/auth`)
-})
+
+// Initialize database connection on startup
+connectToDatabase()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`)
+      console.log(`API available at http://localhost:${PORT}/api/auth`)
+    })
+  })
+  .catch((error) => {
+    console.error("Failed to start server:", error)
+    process.exit(1)
+  })
+
+// Export for Vercel
+export default app
