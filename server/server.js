@@ -135,26 +135,35 @@ app._router.stack.forEach((middleware) => {
 
 // Serve static files in production
 if (process.env.NODE_ENV === "production") {
-  // In Vercel, we don't need to serve static files here
-  // as Vercel handles this through the vercel.json configuration
-
-  // But we still need to handle API routes
+  // In Vercel, we don't serve static files from backend
+  // Handle only API routes
   app.all("*", (req, res, next) => {
     if (req.path.startsWith("/api/")) {
       next()
     } else {
-      // For non-API routes, let Vercel handle it
-      res.status(404).json({ message: "API route not found" })
+      // For non-API routes in production, return API info
+      res.json({ 
+        message: "MERN Auth API is running!",
+        version: "1.0.0",
+        endpoints: ["/api/auth", "/api/health", "/api/test"]
+      })
     }
   })
 } else {
   // For local development, serve static files
   const __dirname = path.dirname(fileURLToPath(import.meta.url))
-  app.use(express.static(path.join(__dirname, "../client/dist")))
-
-  app.get("*", (req, res) => {
-    res.sendFile(path.join(__dirname, "../client/dist/index.html"))
-  })
+  const clientPath = path.join(__dirname, "../client/dist")
+  
+  if (fs.existsSync(clientPath)) {
+    app.use(express.static(clientPath))
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(clientPath, "index.html"))
+    })
+  } else {
+    app.get("*", (req, res) => {
+      res.json({ message: "Client build not found. Run 'npm run build' in client directory." })
+    })
+  }
 }
 
 // Error handling middleware - MUST be placed after all routes
